@@ -10,7 +10,7 @@ import streamlit as st
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "outputs" / "abituriendid_summary"
 ANSWERS_PATH = DATA_DIR / "dashboard_answers.csv"
-METRICS_PATH = DATA_DIR / "dashboard_metrics.csv"
+SCHOOL_GENDER_PATH = DATA_DIR / "kool+sugu.csv"
 
 OVERALL_GROUP_TYPE = "Overall"
 OVERALL_GROUP_VALUE = "All"
@@ -28,14 +28,10 @@ LOCATION_COMPARISON_SERIES = [
 GENDER_ORDER = ["Naine", "Mees", "Mittebinaarne", "Ei soovi avaldada"]
 
 SERIES_COLORS = {
-    OVERALL_LABEL: "#4866E8",
-    "Suurlinnad": "#1B998B",
-    "Väikelinnad/maakohad": "#C77800",
-    "Naine": "#D8578A",
-    "Mees": "#0E7C86",
-    "Mittebinaarne": "#8E63CE",
-    "Ei soovi avaldada": "#6B7280",
+    OVERALL_LABEL: "#F7C948",
 }
+PRIMARY_CHART_COLOR = "#F7C948"
+PIE_COLOR_SEQUENCE = ["#F7C948", "#F4D35E", "#F9E2A2", "#FFD66B", "#F7C948"]
 
 LIKERT_ORDER = [
     "pole üldse nõus",
@@ -114,31 +110,77 @@ def configure_page() -> None:
 
 
 @st.cache_data(show_spinner=False)
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    if not ANSWERS_PATH.exists() or not METRICS_PATH.exists():
-        missing = [
-            str(path)
-            for path in [ANSWERS_PATH, METRICS_PATH]
-            if not path.exists()
-        ]
-        raise FileNotFoundError("Puuduvad andmefailid: " + ", ".join(missing))
+def load_data() -> pd.DataFrame:
+    if not ANSWERS_PATH.exists():
+        raise FileNotFoundError("Puudub andmefail: " + str(ANSWERS_PATH))
 
     answers = pd.read_csv(ANSWERS_PATH, encoding="utf-8-sig")
-    metrics = pd.read_csv(METRICS_PATH, encoding="utf-8-sig")
-
     answers["question_index"] = pd.to_numeric(answers["question_index"], errors="coerce")
     answers["count"] = pd.to_numeric(answers["count"], errors="coerce").fillna(0).astype(int)
     answers["percent"] = pd.to_numeric(answers["percent"], errors="coerce")
     answers["n_answered"] = pd.to_numeric(answers["n_answered"], errors="coerce").fillna(0).astype(int)
+    return answers
 
-    for column in ["n_answered", "n_scored"]:
-        if column in metrics.columns:
-            metrics[column] = pd.to_numeric(metrics[column], errors="coerce").fillna(0).astype(int)
-    for column in ["agree_pct", "disagree_pct", "dont_know_pct", "mean_score"]:
-        if column in metrics.columns:
-            metrics[column] = pd.to_numeric(metrics[column], errors="coerce")
 
-    return answers, metrics
+@st.cache_data(show_spinner=False)
+def load_school_gender_data() -> pd.DataFrame:
+    if not SCHOOL_GENDER_PATH.exists():
+        raise FileNotFoundError("Puudub andmefail: " + str(SCHOOL_GENDER_PATH))
+
+    data = pd.read_csv(SCHOOL_GENDER_PATH, encoding="utf-8-sig", sep=";")
+    data.columns = data.columns.str.strip()
+    return data
+
+
+def build_raw_distribution(
+    values: pd.Series,
+    order: list[str] | None = None,
+) -> pd.DataFrame:
+    counts = values.dropna().astype(str).value_counts()
+    if order is not None:
+        ordered_values = [value for value in order if value in counts.index]
+        other_values = [value for value in counts.index if value not in ordered_values]
+        counts = counts.reindex(ordered_values + other_values).fillna(0).astype(int)
+
+    total = int(counts.sum()) if not counts.empty else 0
+    distribution = pd.DataFrame(
+        {
+            "answer": counts.index.tolist(),
+            OVERALL_LABEL: (counts / total).tolist() if total else [0] * len(counts),
+            f"{OVERALL_LABEL} count": counts.tolist(),
+        }
+    )
+    return distribution
+
+
+def collapse_small_categories(
+    distribution: pd.DataFrame,
+    percent_col: str = OVERALL_LABEL,
+    threshold_pct: float = 4.8,
+    other_label: str = "Muu",
+) -> pd.DataFrame:
+    if distribution.empty:
+        return distribution
+    # percent_col contains fractions (0-1)
+    pct_series = distribution[percent_col] * 100
+    small_mask = pct_series < threshold_pct
+    if not small_mask.any():
+        return distribution
+
+    small_counts = distribution.loc[small_mask, f"{percent_col} count"].sum()
+    small_pct = distribution.loc[small_mask, percent_col].sum()
+
+    large = distribution.loc[~small_mask].copy()
+    # append the aggregated "Muu" row
+    other_row = pd.DataFrame(
+        {
+            "answer": [other_label],
+            percent_col: [small_pct],
+            f"{percent_col} count": [int(small_counts)],
+        }
+    )
+    result = pd.concat([large, other_row], ignore_index=True)
+    return result
 
 
 def question_options(answers: pd.DataFrame) -> list[str]:
@@ -180,15 +222,7 @@ def comparison_series(answers: pd.DataFrame, comparison_mode: str) -> list[tuple
 def answer_order(question_answers: pd.DataFrame) -> list[str]:
     answers = question_answers["answer"].dropna().drop_duplicates().tolist()
     if is_likert_distribution(question_answers):
-        aggregate_answers = {
-            LIKERT_AGGREGATE_MAP.get(answer, answer)
-            for answer in answers
-        }
-        return [
-            answer
-            for answer in LIKERT_AGGREGATE_ORDER
-            if answer in aggregate_answers
-        ]
+        return [answer for answer in LIKERT_ORDER if answer in answers]
 
     known_orders = [LIKERT_ORDER, YES_NO_ORDER, SALARY_ORDER, APP_ORDER]
     for known_order in known_orders:
@@ -279,10 +313,9 @@ def build_distribution(
     rows_by_label: dict[str, pd.DataFrame],
 ) -> pd.DataFrame:
     overall_rows = rows_by_label[OVERALL_LABEL]
-    use_likert_aggregate = is_likert_distribution(overall_rows)
     order = answer_order(overall_rows)
     maps_by_label = {
-        label: distribution_rows(rows, use_likert_aggregate)
+        label: distribution_rows(rows, False)
         .set_index("answer")[["count", "percent"]]
         .to_dict("index")
         for label, rows in rows_by_label.items()
@@ -306,37 +339,40 @@ def build_distribution(
 
 def render_distribution_chart(
     distribution: pd.DataFrame,
-    active_series: list[tuple[str, str, str]],
+    chart_type: str,
 ) -> None:
-    labels = [label for label, _, _ in active_series]
-    chart_df = distribution.melt(
-        id_vars=["answer"],
-        value_vars=labels,
-        var_name="Rühm",
-        value_name="Osakaal",
-    )
-    chart_df["Osakaal, %"] = chart_df["Osakaal"] * 100
     order = distribution["answer"].tolist()
+    distribution["percent"] = distribution[OVERALL_LABEL] * 100
 
-    fig = px.bar(
-        chart_df,
-        x="Osakaal, %",
-        y="answer",
-        color="Rühm",
-        orientation="h",
-        barmode="group",
-        text=chart_df["Osakaal, %"].map(lambda value: f"{value:.1f}%"),
-        category_orders={"answer": list(reversed(order))},
-        color_discrete_map=SERIES_COLORS,
-        labels={"answer": "Vastus", "Osakaal, %": "Osakaal vastanutest (%)"},
-    )
-    fig.update_traces(textposition="outside", cliponaxis=False)
+    if chart_type == "Baarid":
+        fig = px.bar(
+            distribution,
+            x="percent",
+            y="answer",
+            orientation="h",
+            category_orders={"answer": order},
+            labels={"answer": "Vastus", "percent": "Osakaal vastanutest (%)"},
+        )
+        fig.update_traces(marker_color=PRIMARY_CHART_COLOR, texttemplate="%{x:.1f}%")
+        fig.update_layout(
+            xaxis=dict(range=[0, max(10, distribution["percent"].max() * 1.18)]),
+            yaxis_title="",
+        )
+        fig.update_yaxes(categoryorder='array', categoryarray=order)
+    else:
+        fig = px.pie(
+            distribution,
+            values="percent",
+            names="answer",
+            color_discrete_sequence=PIE_COLOR_SEQUENCE,
+            labels={"percent": "Osakaal vastanutest (%)", "answer": "Vastus"},
+        )
+        fig.update_traces(textinfo="percent+label", marker=dict(colors=PIE_COLOR_SEQUENCE))
+
     fig.update_layout(
         height=max(380, 72 * len(order)),
         margin=dict(l=12, r=42, t=10, b=10),
         legend_title_text="",
-        xaxis=dict(range=[0, max(10, chart_df["Osakaal, %"].max() * 1.18)]),
-        yaxis_title="",
         plot_bgcolor="white",
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -390,57 +426,59 @@ def main() -> None:
     configure_page()
 
     try:
-        answers, metrics = load_data()
+        answers = load_data()
     except FileNotFoundError as exc:
         st.error(str(exc))
         st.stop()
 
     questions = question_options(answers)
 
-    st.sidebar.title("Filtrid")
-    selected_question = st.sidebar.selectbox(
-        "Vali küsimus",
-        questions,
-        format_func=lambda question: question_label(question, answers),
-    )
-
-    question_type = (
-        answers.loc[answers["question"].eq(selected_question), "question_type"]
-        .dropna()
-        .iloc[0]
-    )
-
     st.title("Abiturientide küsitluse dashboard")
-    comparison_mode = st.radio(
-        "Võrdluse alus",
-        ["Koolikoht", "Sugu"],
+    chart_type = st.radio(
+        "Diagrammi tüüp",
+        ["Baarid", "Sektordiagramm"],
         horizontal=True,
         label_visibility="visible",
     )
-    active_series = comparison_series(answers, comparison_mode)
 
     st.caption(
-        "Võrdle kõikide vastajate tulemust valitud rühmadega. "
         "Protsendid arvutatakse nende vastajate põhjal, kes vastasid valitud küsimusele."
     )
 
-    rows_by_label = {
-        label: rows_for_question(answers, selected_question, group_type, group_value)
-        for label, group_type, group_value in active_series
-    }
+    school_gender = load_school_gender_data()
+    school_distribution = build_raw_distribution(
+        school_gender["Kus sa koolis käid?"],
+    )
+    school_distribution = collapse_small_categories(school_distribution, threshold_pct=4.8, other_label="Muu")
+    gender_distribution = build_raw_distribution(
+        school_gender["Olen"],
+    )
 
-    distribution = build_distribution(rows_by_label)
+    first_row, second_row = st.columns(2)
+    with first_row:
+        st.subheader("Kus sa koolis käid?")
+        render_distribution_chart(school_distribution, chart_type)
 
-    st.subheader("Vastuste jaotus")
-    render_distribution_chart(distribution, active_series)
-    render_distribution_table(distribution, active_series)
+    with second_row:
+        st.subheader("Sugu")
+        render_distribution_chart(gender_distribution, chart_type)
 
-    if question_type == "likert":
-        render_likert_metrics(metrics, selected_question, active_series)
+    for idx in range(0, len(questions), 2):
+        cols = st.columns(2)
+        for col_index, question in enumerate(questions[idx : idx + 2]):
+            with cols[col_index]:
+                st.subheader(question_label(question, answers))
+                overall_rows = rows_for_question(
+                    answers,
+                    question,
+                    OVERALL_GROUP_TYPE,
+                    OVERALL_GROUP_VALUE,
+                )
+                distribution = build_distribution({OVERALL_LABEL: overall_rows})
+                render_distribution_chart(distribution, chart_type)
 
     with st.expander("Andmete päritolu"):
         st.write(f"Vastuste fail: `{ANSWERS_PATH}`")
-        st.write(f"Mõõdikute fail: `{METRICS_PATH}`")
         st.write(
             "Kui lähteandmed muutuvad, käivita enne dashboard'i uuesti "
             "`create_abituriendid_summary.py`."
